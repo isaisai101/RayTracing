@@ -1,0 +1,176 @@
+#pragma kernel CSMain
+
+struct RTMaterial
+{
+    float4 color;
+    float4 emission;
+    float roughness;
+};
+
+struct SphereData
+{
+    float3 center;
+    float radius;
+};
+
+struct GPUObject 
+{
+    RTMaterial material;
+
+    SphereData sphereData;
+};
+
+struct HitInfo
+{
+    float distance;
+    float3 hitPoint;
+    float3 hitDir;
+    float3 normal;
+    RTMaterial material;
+};
+
+struct Ray
+{
+    float3 origin;
+    float3 direction;
+};
+
+static const float INF = 1e30;
+
+RWTexture2D<float4> result, sum;
+
+StructuredBuffer<GPUObject> objects;
+uint objectCount;
+
+static const float4 white = {1, 1, 1, 1}, black = {0, 0, 0, 1};
+float4 skyColor;
+
+static uint state; 
+
+float3 camPos, camForward, camRight, camUp;
+uint width, height;
+float fov;
+uint frame;
+uint maxDepth;
+
+uint PCGHash(inout uint state)
+{
+    state = state * 747796405u + 2891336453u;
+    uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (word >> 22u) ^ word;
+}
+
+float RandomFloat(inout uint state)  // 0..1
+{
+    return PCGHash(state) / 4294967295.0;
+}
+
+float3 RandomVecInCube(inout uint state) // x/y/z: -1..1
+{
+    return float3(RandomFloat(state)*2-1, RandomFloat(state)*2-1, RandomFloat(state)*2-1);
+}
+
+float3 RandomVecInSphere(inout uint state) 
+{
+    float3 res = RandomVecInCube(state);
+    while (length(res) > 1) {
+        res = RandomVecInCube(state);
+    }
+    
+    return res;
+}
+
+float IntersectSphere(Ray ray, SphereData sphere)
+{
+    float3 oc = ray.origin - sphere.center;
+    float b = dot(oc, ray.direction);
+    float c = dot(oc, oc) - sphere.radius * sphere.radius;
+    float disc = b * b - c;
+
+    if (disc < 0) return INF;
+
+    float s = sqrt(disc);
+
+    float t = -b - s;
+    if (t > 0.001f) return t;
+
+    t = -b + s;
+    if (t > 0.001f) return t;
+
+    return INF;
+}
+
+Ray RandomRay(HitInfo hit, float3 normal)
+{
+    float3 diffuseDir = normalize(normal + normalize(RandomVecInSphere(state)));
+    float3 mirrorDir = reflect(hit.hitDir, normal);
+    float3 dir = normalize(lerp(mirrorDir, diffuseDir, hit.material.roughness));
+
+    Ray res = {hit.hitPoint, dir};
+    return res;   
+}
+
+bool IsSame(float4 a, float4 b) {
+    return all(abs(a - b).rgb < 0.001);
+}
+
+float4 TraceRay(Ray ray, float4 rayColor)
+{
+    float4 res = {0, 0, 0, 1};
+    for (uint depth = 0; depth < maxDepth && !IsSame(rayColor, black); depth++) {
+        HitInfo closestHit = (HitInfo)0;
+        closestHit.distance = INF;
+
+        for (uint i = 0; i < objectCount; i++) {   
+            GPUObject obj = objects[i];
+
+            float dist = IntersectSphere(ray, obj.sphereData);
+            if (dist < closestHit.distance)
+            {
+                float3 hitPoint = ray.origin + ray.direction * dist;
+                HitInfo h = {dist, hitPoint, ray.direction, normalize(hitPoint - obj.sphereData.center), obj.material};
+                closestHit = h;
+            }
+        }
+
+        if (closestHit.distance == INF) {
+            res += skyColor * rayColor;
+            break;
+        }
+
+        res += closestHit.material.emission * rayColor;
+
+        ray = RandomRay(closestHit, closestHit.normal);
+        rayColor *= closestHit.material.color;
+    }
+
+    res.a = 1;
+    return res;
+}
+
+Ray GetCameraRay(int x, int y)
+{
+    float3 origin = camPos;
+    float ratio = (float)width / height;
+
+    float u = (x + 0.5f) / width * 2 - 1, v = (y + 0.5f) / height * 2 - 1;
+    float halfHeight = tan(fov / 2), halfWidth = halfHeight * ratio;
+
+    float3 direction = normalize(camForward + camRight * u * halfWidth + camUp * v * halfHeight);
+
+    Ray res = {origin, direction};
+    return res;
+}
+
+[numthreads(8,8,1)]
+void CSMain(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= width || id.y >= height) return;    
+
+    state = id.x + id.y * width + frame * width * height;
+
+    sum[id.xy] += TraceRay(GetCameraRay(id.x, id.y), white);
+    result[id.xy] = sum[id.xy] / frame;
+
+    // result[id.xy] = float4(id.x & id.y, (id.x & 15)/15.0, (id.y & 15)/15.0, 1.0);
+}
