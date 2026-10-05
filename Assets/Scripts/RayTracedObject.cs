@@ -28,19 +28,39 @@ public struct SphereData
     }
 }
 
+[System.Serializable] 
+public struct MeshData
+{
+    public Vector3[] vertices;
+    public int[] triangles;
+}
+
 public class RayTracedObject : MonoBehaviour
 {
     public static List<RayTracedObject> all = new List<RayTracedObject>();
 
-    public RTMaterial material;   // shows in the Inspector
+    public RTMaterial material = new RTMaterial(Color.white, Color.black, 1f);   // shows in the Inspector
 
-    public SphereData sphereData;
+    public MeshData meshData;
 
     void OnEnable()  { all.Add(this); }
     void OnDisable() { all.Remove(this); }
 
-    void Update()
+    void Awake()
     {
-        sphereData = new SphereData(transform.position, transform.lossyScale.x * 0.5f);
+        Mesh mesh;
+        var mf = GetComponent<MeshFilter>();
+        if (mf != null)
+            mesh = mf.sharedMesh;
+        else
+        {
+            mesh = new Mesh();
+            GetComponent<SkinnedMeshRenderer>().BakeMesh(mesh, true);
+        }
+
+        meshData.vertices = mesh.vertices;
+        for (int i = 0; i < meshData.vertices.Length; i++)
+            meshData.vertices[i] = transform.TransformPoint(meshData.vertices[i]);
+        meshData.triangles = mesh.triangles;
     }
 }

@@ -13,11 +13,19 @@ struct SphereData
     float radius;
 };
 
+struct GPUMesh
+{
+    int firstVertex;
+    int vertexCount;
+    int firstTriangle;
+    int triangleCount;
+    float3 boundsMin;
+    float3 boundsMax;
+};
 struct GPUObject 
 {
     RTMaterial material;
-
-    SphereData sphereData;
+    GPUMesh mesh;
 };
 
 struct HitInfo
@@ -26,7 +34,7 @@ struct HitInfo
     float3 hitPoint;
     float3 hitDir;
     float3 normal;
-    RTMaterial material;
+    int objIndex;
 };
 
 struct Ray
@@ -41,6 +49,12 @@ RWTexture2D<float4> result, sum;
 
 StructuredBuffer<GPUObject> objects;
 uint objectCount;
+
+StructuredBuffer<int> triangles;
+uint triangleCount;
+
+StructuredBuffer<float3> vertices;
+uint vertexCount;
 
 static const float4 white = {1, 1, 1, 1}, black = {0, 0, 0, 1};
 float4 skyColor;
@@ -100,11 +114,87 @@ float IntersectSphere(Ray ray, SphereData sphere)
     return INF;
 }
 
+static const float EDGE_EPS = 1e-5;
+// Möller–Trumbore ray-triangle intersection.
+// t = distance along ray, u/v = barycentric coords.
+float IntersectTriangle(Ray ray, float3 v0, float3 v1, float3 v2)
+{
+    float t = 0, u = 0, v = 0;
+
+    float3 e1 = v1 - v0;
+    float3 e2 = v2 - v0;
+    float3 p = cross(ray.direction, e2);
+    float det = dot(e1, p);
+    if (det < 1e-8) return INF;   // back face, or ray parallel to triangle
+
+    float invDet = 1.0 / det;
+
+    float3 s = ray.origin - v0;
+    u = dot(s, p) * invDet;
+    if (u < -EDGE_EPS || u > 1 + EDGE_EPS) return INF;
+
+    float3 q = cross(s, e1);
+    v = dot(ray.direction, q) * invDet;
+    if (v < -EDGE_EPS || u + v > 1 + EDGE_EPS) return INF;
+
+    t = dot(e2, q) * invDet;
+    return t > 1e-6 ? t : INF;   // small offset avoids hitting the surface you just bounced off
+}
+
+bool IntersectBox(Ray ray, float3 boxMin, float3 boxMax, float maxDist)
+{
+    float3 invDir = 1.0 / ray.direction;
+    float3 t0 = (boxMin - ray.origin) * invDir;
+    float3 t1 = (boxMax - ray.origin) * invDir;
+
+    float3 tNear = min(t0, t1);   // entry distance per axis
+    float3 tFar  = max(t0, t1);   // exit distance per axis
+
+    float enter = max(max(tNear.x, tNear.y), tNear.z);
+    float exit  = min(min(tFar.x, tFar.y), tFar.z);
+
+    return enter <= exit && exit > 0 && enter < maxDist;
+}
+
+HitInfo IntersectMesh(Ray ray, int objIndex, float maxDist) {
+    GPUMesh mesh = objects[objIndex].mesh;
+    HitInfo closestHit = (HitInfo)0;
+    closestHit.distance = INF;
+
+    if (!IntersectBox(ray, mesh.boundsMin, mesh.boundsMax, maxDist))
+        return closestHit;
+
+    for (int i = mesh.firstTriangle*3; i < (mesh.firstTriangle + mesh.triangleCount)*3; i += 3) {
+        float3 v0 = vertices[mesh.firstVertex + triangles[i]];
+        float3 v1 = vertices[mesh.firstVertex + triangles[i + 1]];
+        float3 v2 = vertices[mesh.firstVertex + triangles[i + 2]];
+        float dist = IntersectTriangle(ray, v0, v1, v2);
+
+        if (dist < closestHit.distance) {
+            float3 n = normalize(cross(v1 - v0, v2 - v0));
+            if (dot(n, ray.direction) > 0) {
+                n = -n;
+            }
+
+            HitInfo hitInfo = {
+                dist,
+                ray.origin + ray.direction * dist, 
+                ray.direction, 
+                n, 
+                objIndex
+            };
+            closestHit = hitInfo;
+        }
+    }
+
+    return closestHit;
+}
+
 Ray RandomRay(HitInfo hit, float3 normal)
 {
     float3 diffuseDir = normalize(normal + normalize(RandomVecInSphere(state)));
     float3 mirrorDir = reflect(hit.hitDir, normal);
-    float3 dir = normalize(lerp(mirrorDir, diffuseDir, hit.material.roughness));
+    float3 dir = normalize(lerp(mirrorDir, diffuseDir, objects[hit.objIndex].material.roughness));
 
     Ray res = {hit.hitPoint, dir};
     return res;   
@@ -121,15 +211,11 @@ float4 TraceRay(Ray ray, float4 rayColor)
         HitInfo closestHit = (HitInfo)0;
         closestHit.distance = INF;
 
-        for (uint i = 0; i < objectCount; i++) {   
-            GPUObject obj = objects[i];
-
-            float dist = IntersectSphere(ray, obj.sphereData);
-            if (dist < closestHit.distance)
+        for (uint i = 0; i < objectCount; i++) {
+            HitInfo hitInfo = IntersectMesh(ray, i, closestHit.distance);
+            if (hitInfo.distance < closestHit.distance)
             {
-                float3 hitPoint = ray.origin + ray.direction * dist;
-                HitInfo h = {dist, hitPoint, ray.direction, normalize(hitPoint - obj.sphereData.center), obj.material};
-                closestHit = h;
+                closestHit = hitInfo;
             }
         }
 
@@ -138,10 +224,10 @@ float4 TraceRay(Ray ray, float4 rayColor)
             break;
         }
 
-        res += closestHit.material.emission * rayColor;
+        res += objects[closestHit.objIndex].material.emission * rayColor;
 
         ray = RandomRay(closestHit, closestHit.normal);
-        rayColor *= closestHit.material.color;
+        rayColor *= objects[closestHit.objIndex].material.color;
     }
 
     res.a = 1;
@@ -153,7 +239,8 @@ Ray GetCameraRay(int x, int y)
     float3 origin = camPos;
     float ratio = (float)width / height;
 
-    float u = (x + 0.5f) / width * 2 - 1, v = (y + 0.5f) / height * 2 - 1;
+    float u = (x + RandomFloat(state)) / width * 2 - 1;
+    float v = (y + RandomFloat(state)) / height * 2 - 1;
     float halfHeight = tan(fov / 2), halfWidth = halfHeight * ratio;
 
     float3 direction = normalize(camForward + camRight * u * halfWidth + camUp * v * halfHeight);
@@ -169,8 +256,11 @@ void CSMain(uint3 id : SV_DispatchThreadID)
 
     state = id.x + id.y * width + frame * width * height;
 
-    sum[id.xy] += TraceRay(GetCameraRay(id.x, id.y), white);
-    result[id.xy] = sum[id.xy] / frame;
+    int cnt = 2;
+    for (int i = 1; i <= cnt; i++) {
+        sum[id.xy] += TraceRay(GetCameraRay(id.x, id.y), white);
+    }
+    result[id.xy] = sum[id.xy] / cnt / frame;
 
     // result[id.xy] = float4(id.x & id.y, (id.x & 15)/15.0, (id.y & 15)/15.0, 1.0);
 }
