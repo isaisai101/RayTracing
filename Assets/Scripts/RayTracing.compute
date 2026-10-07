@@ -15,13 +15,16 @@ struct SphereData
 
 struct GPUMesh
 {
-    int firstVertex;
-    int vertexCount;
-    int firstTriangle;
-    int triangleCount;
-    float3 boundsMin;
-    float3 boundsMax;
+    int root;
 };
+
+struct BVHNode
+{
+    float3 boxMin, boxMax;
+    int left;
+    int triCount;
+};
+
 struct GPUObject 
 {
     RTMaterial material;
@@ -56,6 +59,8 @@ uint triangleCount;
 StructuredBuffer<float3> vertices;
 uint vertexCount;
 
+StructuredBuffer<BVHNode> nodes;
+
 static const float4 white = {1, 1, 1, 1}, black = {0, 0, 0, 1};
 float4 skyColor;
 
@@ -65,7 +70,7 @@ float3 camPos, camForward, camRight, camUp;
 uint width, height;
 float fov;
 uint frame;
-uint maxDepth;
+uint maxBounce;
 
 uint PCGHash(inout uint state)
 {
@@ -92,6 +97,20 @@ float3 RandomVecInSphere(inout uint state)
     }
     
     return res;
+}
+
+void Swap(inout int a, inout int b) 
+{
+    int temp;
+    temp = b;
+    b = a; a = temp;
+}
+
+void Swap(inout float a, inout float b) 
+{
+    float temp;
+    temp = b;
+    b = a; a = temp;    
 }
 
 float IntersectSphere(Ray ray, SphereData sphere)
@@ -141,7 +160,7 @@ float IntersectTriangle(Ray ray, float3 v0, float3 v1, float3 v2)
     return t > 1e-6 ? t : INF;   // small offset avoids hitting the surface you just bounced off
 }
 
-bool IntersectBox(Ray ray, float3 boxMin, float3 boxMax, float maxDist)
+float IntersectBox(Ray ray, float3 boxMin, float3 boxMax)
 {
     float3 invDir = 1.0 / ray.direction;
     float3 t0 = (boxMin - ray.origin) * invDir;
@@ -153,37 +172,66 @@ bool IntersectBox(Ray ray, float3 boxMin, float3 boxMax, float maxDist)
     float enter = max(max(tNear.x, tNear.y), tNear.z);
     float exit  = min(min(tFar.x, tFar.y), tFar.z);
 
-    return enter <= exit && exit > 0 && enter < maxDist;
+    return enter <= exit && exit > 0 ? enter : INF;
 }
 
 HitInfo IntersectMesh(Ray ray, int objIndex, float maxDist) {
     GPUMesh mesh = objects[objIndex].mesh;
-    HitInfo closestHit = (HitInfo)0;
+    HitInfo closestHit = (HitInfo)0;    
     closestHit.distance = INF;
 
-    if (!IntersectBox(ray, mesh.boundsMin, mesh.boundsMax, maxDist))
-        return closestHit;
+    int dfsNodes[32];
+    int size = 1;
+    dfsNodes[0] = mesh.root;
 
-    for (int i = mesh.firstTriangle*3; i < (mesh.firstTriangle + mesh.triangleCount)*3; i += 3) {
-        float3 v0 = vertices[mesh.firstVertex + triangles[i]];
-        float3 v1 = vertices[mesh.firstVertex + triangles[i + 1]];
-        float3 v2 = vertices[mesh.firstVertex + triangles[i + 2]];
-        float dist = IntersectTriangle(ray, v0, v1, v2);
+    while (size) {
+        int v = dfsNodes[size - 1];
+        size--;
+        if (IntersectBox(ray, nodes[v].boxMin, nodes[v].boxMax) >= maxDist) continue;
 
-        if (dist < closestHit.distance) {
-            float3 n = normalize(cross(v1 - v0, v2 - v0));
-            if (dot(n, ray.direction) > 0) {
-                n = -n;
+        if (nodes[v].triCount == 0) {
+            int x = nodes[v].left, y = x + 1;
+            float distX = IntersectBox(ray, nodes[x].boxMin, nodes[x].boxMax);
+            float distY = IntersectBox(ray, nodes[y].boxMin, nodes[y].boxMax);
+            if (distX > distY) {
+                Swap(x, y);
+                Swap(distX, distY);
             }
+            
+            if (distY < maxDist) {
+                size++;
+                dfsNodes[size - 1] = y;
+            }
+            if (distX < maxDist) {
+                size++;
+                dfsNodes[size - 1] = x;
+            }
+            continue;
+        }
 
-            HitInfo hitInfo = {
-                dist,
-                ray.origin + ray.direction * dist, 
-                ray.direction, 
-                n, 
-                objIndex
-            };
-            closestHit = hitInfo;
+        for (int i = nodes[v].left * 3; i < (nodes[v].left + nodes[v].triCount) * 3; i += 3) {
+            float3 v0 = vertices[triangles[i]];
+            float3 v1 = vertices[triangles[i + 1]];
+            float3 v2 = vertices[triangles[i + 2]];
+            float dist = IntersectTriangle(ray, v0, v1, v2);
+
+            if (dist < closestHit.distance) {
+                float3 n = normalize(cross(v1 - v0, v2 - v0));
+                if (dot(n, ray.direction) > 0) {
+                    n = -n;
+                }
+
+                HitInfo hitInfo = {
+                    dist,
+                    ray.origin + ray.direction * dist, 
+                    ray.direction, 
+                    n, 
+                    objIndex
+                };
+                closestHit = hitInfo;
+
+                maxDist = min(maxDist, closestHit.distance);
+            }
         }
     }
 
@@ -207,7 +255,7 @@ bool IsSame(float4 a, float4 b) {
 float4 TraceRay(Ray ray, float4 rayColor)
 {
     float4 res = {0, 0, 0, 1};
-    for (uint depth = 0; depth < maxDepth && !IsSame(rayColor, black); depth++) {
+    for (uint depth = 0; depth < maxBounce && !IsSame(rayColor, black); depth++) {
         HitInfo closestHit = (HitInfo)0;
         closestHit.distance = INF;
 
@@ -256,11 +304,12 @@ void CSMain(uint3 id : SV_DispatchThreadID)
 
     state = id.x + id.y * width + frame * width * height;
 
-    int cnt = 2;
+    int cnt = 1;
+    sum[id.xy] = 0;
     for (int i = 1; i <= cnt; i++) {
         sum[id.xy] += TraceRay(GetCameraRay(id.x, id.y), white);
     }
-    result[id.xy] = sum[id.xy] / cnt / frame;
+    result[id.xy] = lerp(result[id.xy], sum[id.xy] / cnt, 1.0 / frame);
 
     // result[id.xy] = float4(id.x & id.y, (id.x & 15)/15.0, (id.y & 15)/15.0, 1.0);
 }
